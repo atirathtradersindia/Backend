@@ -1,18 +1,30 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 import feedparser
 import httpx
 from datetime import datetime
 import random
 import asyncio
 import json
-from typing import Optional, Dict, List
-import aiohttp
-import time
-import hashlib
-from cachetools import TTLCache
+import razorpay
+import paypalrestsdk
+import uuid
 
-app = FastAPI(title="Agriculture & Location Services API")
+app = FastAPI(title="Agriculture RSS API with Payment Integration")
+
+# Razorpay Configuration
+RAZORPAY_KEY_ID = "rzp_test_RfSBzDny9nssx0"
+RAZORPAY_KEY_SECRET = "DlkCwr3REoiDYce6UzQuJmMx"
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+# PayPal Configuration
+paypalrestsdk.configure({
+    "mode": "sandbox",  # Change to "live" for production
+    "client_id": "AURJ-JxP9ks57rmAjpgygYWhay5TjDahC_6o5s89h7tu73o-UIlm7mYFSb_CSqS3u7l1TDAyQizRXLqV",
+    "client_secret": "EHXLKzPPM12wGTHtNEnjVr9dEp0T8w9T_OH86wXg8ShYLSYoFmN_VTrMnrIIuOTnJ9HkGmZQ4wlsy9O3"
+})
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,9 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Cache setup (24 hours TTL)
-pincode_cache = TTLCache(maxsize=1000, ttl=86400)
 
 # Enhanced RSS sources for rice and agriculture news
 RSS_SOURCES = [
@@ -93,7 +102,7 @@ INDIAN_AGRI_RSS_SOURCES = [
     }
 ]
 
-# Base prices for basmati rice
+# Base prices for basmati rice (will be dynamically adjusted)
 BASE_BASMATI_PRICES = {
     "Traditional Basmati": {
         "base_price": 1450,
@@ -125,356 +134,318 @@ BASE_BASMATI_PRICES = {
     }
 }
 
-# Country code rules for pincode lookup
-COUNTRY_CODE_RULES = {
-    '+91': {
-        'name': 'India', 
-        'length': 10, 
-        'pincode_length': 6,
-        'api_endpoint': 'https://api.postalpincode.in/pincode/{pincode}',
-        'api_type': 'india'
-    },
-    '+1': {
-        'name': 'USA/Canada',
-        'length': 10,
-        'pincode_length': 5,
-        'api_endpoint': 'https://api.zippopotam.us/{country}/{pincode}',
-        'api_type': 'zippopotam'
-    },
-    '+44': {
-        'name': 'UK',
-        'length': 10,
-        'pincode_length': 7,
-        'api_endpoint': 'https://api.postcodes.io/postcodes/{postcode}',
-        'api_type': 'postcodes_io'
-    },
-    '+971': {
-        'name': 'UAE',
-        'length': 9,
-        'pincode_length': 5,
-        'api_type': 'manual'
-    },
-    '+966': {
-        'name': 'Saudi Arabia',
-        'length': 9,
-        'pincode_length': 5,
-        'api_type': 'manual'
-    },
-    '+81': {
-        'name': 'Japan',
-        'length': 10,
-        'pincode_length': 7,
-        'api_type': 'manual'
-    },
-    '+49': {
-        'name': 'Germany',
-        'length': 11,
-        'pincode_length': 5,
-        'api_type': 'manual'
-    },
-    '+33': {
-        'name': 'France',
-        'length': 9,
-        'pincode_length': 5,
-        'api_type': 'manual'
-    },
-    '+86': {
-        'name': 'China',
-        'length': 11,
-        'pincode_length': 6,
-        'api_type': 'manual'
-    }
-}
+# Pydantic models for payment requests
+class RazorpayOrderRequest(BaseModel):
+    amount: float
+    currency: str = "INR"
+    customer_name: Optional[str] = ""
+    customer_email: Optional[str] = ""
+    customer_phone: Optional[str] = ""
+    description: Optional[str] = "Rice Sample Purchase"
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_payment_id: str
+    razorpay_order_id: str
+    razorpay_signature: str
+
+class PayPalOrderRequest(BaseModel):
+    amount: float
+    currency: str = "USD"
+    description: Optional[str] = "Rice Sample Purchase"
+    customer_name: Optional[str] = ""
+    customer_email: Optional[str] = ""
+    return_url: Optional[str] = "http://localhost:5173/payment-success"
+    cancel_url: Optional[str] = "http://localhost:5173/payment-cancel"
+
+class PayPalExecuteRequest(BaseModel):
+    payment_id: str
+    payer_id: str
 
 @app.get("/")
 def home():
-    return {
-        "message": "Agriculture & Location Services API is running!",
-        "version": "4.0",
-        "services": [
-            "Rice RSS Feed",
-            "Live Basmati Prices", 
-            "Indian Agriculture RSS",
-            "Pincode/Zipcode Lookup",
-            "Health Check"
-        ]
-    }
+    return {"message": "Agriculture RSS API with Payment Integration is running!"}
 
-# ============== PINCODE LOOKUP API ==============
-@app.get("/api/pincode-lookup")
-async def pincode_lookup(pincode: str, country_code: str = "+91"):
+# ==================== RAZORPAY ENDPOINTS ====================
+
+@app.post("/create-razorpay-order")
+async def create_razorpay_order(request: RazorpayOrderRequest):
     """
-    Unified pincode/zipcode lookup for multiple countries
+    Create a Razorpay order for Indian customers
     """
-    # Create cache key
-    cache_key = hashlib.md5(f"{country_code}:{pincode}".encode()).hexdigest()
-    
-    # Check cache first
-    if cache_key in pincode_cache:
-        cached_result = pincode_cache[cache_key]
-        return {**cached_result, "cached": True, "cache_hit": True}
-    
-    # Validate country code
-    if country_code not in COUNTRY_CODE_RULES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported country code: {country_code}. Supported codes: {list(COUNTRY_CODE_RULES.keys())}"
-        )
-    
-    country_info = COUNTRY_CODE_RULES[country_code]
-    
-    # Validate pincode length
-    min_length = country_info.get('pincode_length', 4)
-    if len(pincode) < min_length:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Pincode too short. Minimum {min_length} characters required for {country_info['name']}"
-        )
-    
-    # Handle manual entry countries
-    if country_info.get('api_type') == 'manual':
-        result = {
-            "success": False,
-            "message": f"Manual entry required for {country_info['name']}",
-            "requires_manual": True,
-            "country": country_info['name'],
-            "pincode": pincode
-        }
-        pincode_cache[cache_key] = result
-        return result
-    
     try:
-        # Fetch address based on country
-        if country_info['api_type'] == 'india':
-            address_data = await fetch_india_pincode(pincode)
-        elif country_info['api_type'] == 'zippopotam':
-            address_data = await fetch_zippopotam(pincode, country_code)
-        elif country_info['api_type'] == 'postcodes_io':
-            address_data = await fetch_uk_postcode(pincode)
-        else:
-            address_data = None
+        # Convert amount to paisa (smallest currency unit)
+        amount_in_paisa = int(request.amount * 100)
         
-        if address_data and address_data.get('success'):
-            result = {
-                "success": True,
-                "data": address_data['data'],
-                "country": country_info['name'],
-                "pincode": pincode,
-                "source": address_data.get('source', 'primary')
+        # Generate a unique receipt ID
+        receipt_id = f"order_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        
+        order_data = {
+            "amount": amount_in_paisa,
+            "currency": request.currency,
+            "receipt": receipt_id,
+            "payment_capture": 1,
+            "notes": {
+                "customer_name": request.customer_name,
+                "customer_email": request.customer_email,
+                "customer_phone": request.customer_phone,
+                "description": request.description,
+                "created_at": datetime.now().isoformat()
+            }
+        }
+        
+        order = razorpay_client.order.create(order_data)
+        
+        return {
+            "status": "success",
+            "order": {
+                "id": order["id"],
+                "amount": order["amount"],
+                "currency": order["currency"],
+                "receipt": order.get("receipt", receipt_id)
+            },
+            "key_id": RAZORPAY_KEY_ID,
+            "customer_details": {
+                "name": request.customer_name,
+                "email": request.customer_email,
+                "contact": request.customer_phone
+            }
+        }
+        
+    except Exception as e:
+        print(f"Razorpay order creation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Razorpay order creation failed: {str(e)}")
+
+@app.post("/verify-razorpay-payment")
+async def verify_razorpay_payment(request: RazorpayVerifyRequest):
+    """
+    Verify Razorpay payment signature
+    """
+    try:
+        params_dict = {
+            'razorpay_order_id': request.razorpay_order_id,
+            'razorpay_payment_id': request.razorpay_payment_id,
+            'razorpay_signature': request.razorpay_signature
+        }
+        
+        # Verify the payment signature
+        razorpay_client.utility.verify_payment_signature(params_dict)
+        
+        # Fetch payment details
+        payment = razorpay_client.payment.fetch(request.razorpay_payment_id)
+        order = razorpay_client.order.fetch(request.razorpay_order_id)
+        
+        return {
+            "status": "success",
+            "message": "Payment verified successfully",
+            "payment": {
+                "id": payment.get('id'),
+                "amount": payment.get('amount'),
+                "currency": payment.get('currency'),
+                "status": payment.get('status'),
+                "method": payment.get('method'),
+                "created_at": payment.get('created_at'),
+                "captured": payment.get('captured')
+            },
+            "order": {
+                "id": order.get('id'),
+                "amount": order.get('amount'),
+                "currency": order.get('currency'),
+                "status": order.get('status'),
+                "receipt": order.get('receipt')
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except razorpay.errors.SignatureVerificationError as e:
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+    except Exception as e:
+        print(f"Razorpay verification error: {e}")
+        raise HTTPException(status_code=500, detail=f"Payment verification failed: {str(e)}")
+
+@app.get("/razorpay-order/{order_id}")
+async def get_razorpay_order(order_id: str):
+    """
+    Get Razorpay order details
+    """
+    try:
+        order = razorpay_client.order.fetch(order_id)
+        return {
+            "status": "success",
+            "order": order
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Order not found: {str(e)}")
+
+# ==================== PAYPAL ENDPOINTS ====================
+
+@app.post("/create-paypal-order")
+async def create_paypal_order(request: PayPalOrderRequest):
+    """
+    Create a PayPal order for international customers
+    """
+    try:
+        # Create PayPal payment
+        payment = paypalrestsdk.Payment({
+            "intent": "sale",
+            "payer": {
+                "payment_method": "paypal"
+            },
+            "redirect_urls": {
+                "return_url": request.return_url,
+                "cancel_url": request.cancel_url
+            },
+            "transactions": [{
+                "amount": {
+                    "total": f"{request.amount:.2f}",
+                    "currency": request.currency
+                },
+                "description": request.description,
+                "custom": json.dumps({
+                    "customer_name": request.customer_name,
+                    "customer_email": request.customer_email,
+                    "created_at": datetime.now().isoformat()
+                }),
+                "invoice_number": f"INV-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+            }]
+        })
+        
+        if payment.create():
+            # Extract approval URL
+            approval_url = next(link.href for link in payment.links if link.rel == "approval_url")
+            
+            return {
+                "status": "success",
+                "payment_id": payment.id,
+                "approval_url": approval_url,
+                "amount": request.amount,
+                "currency": request.currency,
+                "description": request.description,
+                "customer_details": {
+                    "name": request.customer_name,
+                    "email": request.customer_email
+                }
             }
         else:
-            result = {
-                "success": False,
-                "message": address_data.get('message', 'No address found for this pincode'),
-                "country": country_info['name'],
-                "pincode": pincode,
-                "suggestions": address_data.get('suggestions', [])
+            error_message = payment.error.get('message', 'Unknown error') if payment.error else 'Payment creation failed'
+            raise HTTPException(status_code=500, detail=error_message)
+            
+    except Exception as e:
+        print(f"PayPal order creation error: {e}")
+        raise HTTPException(status_code=500, detail=f"PayPal order creation failed: {str(e)}")
+
+@app.post("/execute-paypal-payment")
+async def execute_paypal_payment(request: PayPalExecuteRequest):
+    """
+    Execute PayPal payment after user approval
+    """
+    try:
+        payment = paypalrestsdk.Payment.find(request.payment_id)
+        
+        if payment.execute({"payer_id": request.payer_id}):
+            # Get transaction details
+            transaction = payment.transactions[0]
+            sale = payment.transactions[0].related_resources[0].sale
+            
+            return {
+                "status": "success",
+                "message": "Payment executed successfully",
+                "payment": {
+                    "id": payment.id,
+                    "state": payment.state,
+                    "intent": payment.intent,
+                    "create_time": payment.create_time
+                },
+                "transaction": {
+                    "amount": transaction.amount.total,
+                    "currency": transaction.amount.currency,
+                    "description": transaction.description,
+                    "invoice_number": transaction.invoice_number
+                },
+                "sale": {
+                    "id": sale.id,
+                    "state": sale.state,
+                    "amount": sale.amount.total,
+                    "currency": sale.amount.currency
+                },
+                "payer": {
+                    "payer_info": payment.payer.payer_info
+                },
+                "timestamp": datetime.now().isoformat()
             }
-        
-        # Cache the result
-        pincode_cache[cache_key] = result
-        return result
-        
-    except Exception as e:
-        error_result = {
-            "success": False,
-            "message": f"Service temporarily unavailable: {str(e)}",
-            "country": country_info['name'],
-            "pincode": pincode,
-            "error": str(e),
-            "requires_manual": True
-        }
-        return error_result
-
-async def fetch_india_pincode(pincode: str) -> Dict:
-    """Fetch address data for Indian pincode"""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = COUNTRY_CODE_RULES['+91']['api_endpoint'].format(pincode=pincode)
-            response = await client.get(url)
+        else:
+            error_message = payment.error.get('message', 'Unknown error') if payment.error else 'Payment execution failed'
+            raise HTTPException(status_code=500, detail=error_message)
             
-            if response.status_code == 200:
-                data = response.json()
-                
-                if (isinstance(data, list) and len(data) > 0 and 
-                    data[0].get('Status') == "Success" and 
-                    data[0].get('PostOffice')):
-                    
-                    office = data[0]['PostOffice'][0]
-                    return {
-                        "success": True,
-                        "data": {
-                            "area": office.get('Name', ''),
-                            "town": office.get('Block', office.get('District', '')),
-                            "city": office.get('District', ''),
-                            "district": office.get('District', ''),
-                            "state": office.get('State', ''),
-                            "country": "India"
-                        },
-                        "source": "api.postalpincode.in"
-                    }
-        
-        # Fallback to geonames API
-        return await fallback_geonames_lookup(pincode, 'IN')
-        
     except Exception as e:
-        return {
-            "success": False,
-            "message": f"Error fetching India pincode: {str(e)}",
-            "error": str(e)
-        }
+        print(f"PayPal execution error: {e}")
+        raise HTTPException(status_code=500, detail=f"PayPal payment execution failed: {str(e)}")
 
-async def fetch_zippopotam(pincode: str, country_code: str) -> Dict:
-    """Fetch address data for US/Canada using Zippopotam"""
+@app.get("/paypal-payment/{payment_id}")
+async def get_paypal_payment(payment_id: str):
+    """
+    Get PayPal payment details
+    """
     try:
-        country = 'us' if country_code == '+1' else 'ca'
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = COUNTRY_CODE_RULES[country_code]['api_endpoint'].format(
-                country=country, pincode=pincode
-            )
-            response = await client.get(url)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('places') and len(data['places']) > 0:
-                    place = data['places'][0]
-                    country_name = 'United States' if country == 'us' else 'Canada'
-                    
-                    return {
-                        "success": True,
-                        "data": {
-                            "area": place.get('place name', ''),
-                            "town": place.get('place name', ''),
-                            "city": place.get('place name', ''),
-                            "district": place.get('state', place.get('state abbreviation', '')),
-                            "state": place.get('state', ''),
-                            "country": country_name
-                        },
-                        "source": "api.zippopotam.us"
-                    }
-        
+        payment = paypalrestsdk.Payment.find(payment_id)
         return {
-            "success": False,
-            "message": "No address found for this zipcode"
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Error fetching zipcode: {str(e)}",
-            "error": str(e)
-        }
-
-async def fetch_uk_postcode(postcode: str) -> Dict:
-    """Fetch address data for UK postcode"""
-    try:
-        # Clean postcode
-        clean_postcode = postcode.replace(' ', '').upper()
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = COUNTRY_CODE_RULES['+44']['api_endpoint'].format(postcode=clean_postcode)
-            response = await client.get(url)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('status') == 200 and data.get('result'):
-                    result = data['result']
-                    return {
-                        "success": True,
-                        "data": {
-                            "area": result.get('admin_ward', ''),
-                            "town": result.get('admin_district', result.get('region', '')),
-                            "city": result.get('admin_district', result.get('region', '')),
-                            "district": result.get('region', result.get('country', '')),
-                            "state": result.get('region', ''),
-                            "country": "United Kingdom"
-                        },
-                        "source": "api.postcodes.io"
-                    }
-        
-        return {
-            "success": False,
-            "message": "No address found for this postcode"
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"Error fetching UK postcode: {str(e)}",
-            "error": str(e)
-        }
-
-async def fallback_geonames_lookup(code: str, country_code: str) -> Dict:
-    """Fallback lookup using Geonames API (requires API key)"""
-    # This is a placeholder - you need to get a free API key from geonames.org
-    geonames_username = "demo"  # Replace with your geonames username
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = f"http://api.geonames.org/postalCodeSearchJSON"
-            params = {
-                'postalcode': code,
-                'country': country_code,
-                'maxRows': 1,
-                'username': geonames_username
+            "status": "success",
+            "payment": {
+                "id": payment.id,
+                "state": payment.state,
+                "intent": payment.intent,
+                "create_time": payment.create_time,
+                "transactions": payment.transactions
             }
-            
-            response = await client.get(url, params=params)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('postalCodes') and len(data['postalCodes']) > 0:
-                    place = data['postalCodes'][0]
-                    return {
-                        "success": True,
-                        "data": {
-                            "area": place.get('placeName', ''),
-                            "town": place.get('adminName2', place.get('adminName1', '')),
-                            "city": place.get('adminName2', place.get('adminName1', '')),
-                            "district": place.get('adminName1', ''),
-                            "state": place.get('adminName1', ''),
-                            "country": place.get('countryCode', '')
-                        },
-                        "source": "geonames.org"
-                    }
-        
-        return {
-            "success": False,
-            "message": "No address found in fallback service"
         }
-        
     except Exception as e:
-        return {
-            "success": False,
-            "message": f"Fallback service error: {str(e)}"
-        }
+        raise HTTPException(status_code=404, detail=f"Payment not found: {str(e)}")
 
-@app.get("/api/country-codes")
-async def get_country_codes():
-    """Get available country codes and their rules"""
-    simplified_rules = {}
-    for code, info in COUNTRY_CODE_RULES.items():
-        simplified_rules[code] = {
-            "name": info['name'],
-            "phone_length": info['length'],
-            "pincode_length": info.get('pincode_length', 0),
-            "supported": info.get('api_type') != 'manual'
-        }
-    
-    return {
-        "country_codes": simplified_rules,
-        "count": len(simplified_rules),
-        "timestamp": datetime.now().isoformat()
-    }
+# ==================== PAYMENT STATUS ENDPOINT ====================
 
-# ============== EXISTING RSS & PRICE APIS ==============
+@app.get("/payment-status/{payment_id}")
+async def get_payment_status(payment_id: str, gateway: str = "razorpay"):
+    """
+    Get payment status for either Razorpay or PayPal
+    """
+    try:
+        if gateway == "razorpay":
+            payment = razorpay_client.payment.fetch(payment_id)
+            return {
+                "gateway": "razorpay",
+                "status": payment.get('status'),
+                "amount": payment.get('amount'),
+                "currency": payment.get('currency'),
+                "method": payment.get('method'),
+                "created_at": payment.get('created_at'),
+                "captured": payment.get('captured'),
+                "order_id": payment.get('order_id')
+            }
+        elif gateway == "paypal":
+            payment = paypalrestsdk.Payment.find(payment_id)
+            return {
+                "gateway": "paypal",
+                "status": payment.state,
+                "id": payment.id,
+                "create_time": payment.create_time,
+                "intent": payment.intent,
+                "transactions": payment.transactions
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Invalid payment gateway specified")
+            
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Payment not found: {str(e)}")
+
+# ==================== EXISTING RSS ENDPOINTS ====================
+
 @app.get("/live-basmati-prices")
 async def get_live_basmati_prices():
-    """Generate realistic live prices for basmati rice with market trends"""
+    """
+    Generate realistic live prices for basmati rice with market trends
+    """
     try:
         market_trend = await get_market_sentiment()
+        
         live_prices = []
         
         for product, details in BASE_BASMATI_PRICES.items():
@@ -489,6 +460,7 @@ async def get_live_basmati_prices():
                 trend_factor = random.uniform(-0.005, 0.005)
             
             volatility_factor = random.uniform(-volatility, volatility)
+            
             final_price = base_price * (1 + trend_factor + volatility_factor)
             final_price = round(final_price, 2)
             
@@ -533,7 +505,9 @@ async def get_live_basmati_prices():
         }
 
 async def get_market_sentiment():
-    """Analyze market sentiment based on recent news and trends"""
+    """
+    Analyze market sentiment based on recent news and trends
+    """
     try:
         factors = {
             "export_demand": random.choice(["strong", "moderate", "weak"]),
@@ -601,7 +575,9 @@ async def fetch_single_feed(source, is_indian_agri=False):
 
 @app.get("/rss")
 async def get_rss_feed():
-    """Fetches latest RSS articles from multiple sources with enhanced rice filtering"""
+    """
+    Fetches latest RSS articles from multiple sources with enhanced rice filtering
+    """
     try:
         tasks = [fetch_single_feed(source) for source in RSS_SOURCES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -658,7 +634,9 @@ async def get_rss_feed():
 
 @app.get("/indian-agri-rss")
 async def get_indian_agri_rss():
-    """Fetches Indian Agriculture and DGFT related RSS feeds with enhanced filtering"""
+    """
+    Fetches Indian Agriculture and DGFT related RSS feeds with enhanced filtering
+    """
     try:
         tasks = [fetch_single_feed(source, is_indian_agri=True) for source in INDIAN_AGRI_RSS_SOURCES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -768,41 +746,26 @@ def health_check():
     return {
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "service": "Agriculture RSS & Location Services API",
+        "service": "Agriculture RSS & Live Prices API with Payment Integration",
         "version": "4.0",
         "endpoints": {
             "live_prices": "/live-basmati-prices",
             "rice_rss": "/rss",
             "indian_agri_rss": "/indian-agri-rss",
-            "pincode_lookup": "/api/pincode-lookup?pincode=110001&country_code=+91",
-            "country_codes": "/api/country-codes"
-        },
-        "cache_stats": {
-            "size": len(pincode_cache),
-            "max_size": 1000,
-            "ttl_seconds": 86400
+            "razorpay_create": "/create-razorpay-order",
+            "razorpay_verify": "/verify-razorpay-payment",
+            "paypal_create": "/create-paypal-order",
+            "paypal_execute": "/execute-paypal-payment",
+            "payment_status": "/payment-status/{payment_id}"
         }
-    }
-
-@app.get("/api/cache-stats")
-def cache_stats():
-    """Get cache statistics"""
-    return {
-        "cache_size": len(pincode_cache),
-        "max_size": 1000,
-        "ttl_seconds": 86400,
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.delete("/api/clear-cache")
-def clear_cache():
-    """Clear the pincode cache"""
-    pincode_cache.clear()
-    return {
-        "message": "Cache cleared successfully",
-        "timestamp": datetime.now().isoformat()
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    print("=" * 60)
+    print("Agriculture RSS API with Payment Integration")
+    print("=" * 60)
+    print(f"Razorpay Key ID: {RAZORPAY_KEY_ID}")
+    print("PayPal Mode: sandbox")
+    print("=" * 60)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
 import httpx
@@ -6,8 +6,13 @@ from datetime import datetime
 import random
 import asyncio
 import json
+from typing import Optional, Dict, List
+import aiohttp
+import time
+import hashlib
+from cachetools import TTLCache
 
-app = FastAPI(title="Agriculture RSS API")
+app = FastAPI(title="Agriculture & Location Services API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,6 +21,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Cache setup (24 hours TTL)
+pincode_cache = TTLCache(maxsize=1000, ttl=86400)
 
 # Enhanced RSS sources for rice and agriculture news
 RSS_SOURCES = [
@@ -85,14 +93,14 @@ INDIAN_AGRI_RSS_SOURCES = [
     }
 ]
 
-# Base prices for basmati rice (will be dynamically adjusted)
+# Base prices for basmati rice
 BASE_BASMATI_PRICES = {
     "Traditional Basmati": {
         "base_price": 1450,
         "specification": "8.10mm max",
         "packing": "50 KG PP", 
         "port": "Mundra",
-        "volatility": 0.02  # 2% price fluctuation
+        "volatility": 0.02
     },
     "Pusa White Sella": {
         "base_price": 1380,
@@ -117,41 +125,373 @@ BASE_BASMATI_PRICES = {
     }
 }
 
+# Country code rules for pincode lookup
+COUNTRY_CODE_RULES = {
+    '+91': {
+        'name': 'India', 
+        'length': 10, 
+        'pincode_length': 6,
+        'api_endpoint': 'https://api.postalpincode.in/pincode/{pincode}',
+        'api_type': 'india'
+    },
+    '+1': {
+        'name': 'USA/Canada',
+        'length': 10,
+        'pincode_length': 5,
+        'api_endpoint': 'https://api.zippopotam.us/{country}/{pincode}',
+        'api_type': 'zippopotam'
+    },
+    '+44': {
+        'name': 'UK',
+        'length': 10,
+        'pincode_length': 7,
+        'api_endpoint': 'https://api.postcodes.io/postcodes/{postcode}',
+        'api_type': 'postcodes_io'
+    },
+    '+971': {
+        'name': 'UAE',
+        'length': 9,
+        'pincode_length': 5,
+        'api_type': 'manual'
+    },
+    '+966': {
+        'name': 'Saudi Arabia',
+        'length': 9,
+        'pincode_length': 5,
+        'api_type': 'manual'
+    },
+    '+81': {
+        'name': 'Japan',
+        'length': 10,
+        'pincode_length': 7,
+        'api_type': 'manual'
+    },
+    '+49': {
+        'name': 'Germany',
+        'length': 11,
+        'pincode_length': 5,
+        'api_type': 'manual'
+    },
+    '+33': {
+        'name': 'France',
+        'length': 9,
+        'pincode_length': 5,
+        'api_type': 'manual'
+    },
+    '+86': {
+        'name': 'China',
+        'length': 11,
+        'pincode_length': 6,
+        'api_type': 'manual'
+    }
+}
+
 @app.get("/")
 def home():
-    return {"message": "Agriculture RSS API is running!"}
+    return {
+        "message": "Agriculture & Location Services API is running!",
+        "version": "4.0",
+        "services": [
+            "Rice RSS Feed",
+            "Live Basmati Prices", 
+            "Indian Agriculture RSS",
+            "Pincode/Zipcode Lookup",
+            "Health Check"
+        ]
+    }
 
+# ============== PINCODE LOOKUP API ==============
+@app.get("/api/pincode-lookup")
+async def pincode_lookup(pincode: str, country_code: str = "+91"):
+    """
+    Unified pincode/zipcode lookup for multiple countries
+    """
+    # Create cache key
+    cache_key = hashlib.md5(f"{country_code}:{pincode}".encode()).hexdigest()
+    
+    # Check cache first
+    if cache_key in pincode_cache:
+        cached_result = pincode_cache[cache_key]
+        return {**cached_result, "cached": True, "cache_hit": True}
+    
+    # Validate country code
+    if country_code not in COUNTRY_CODE_RULES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported country code: {country_code}. Supported codes: {list(COUNTRY_CODE_RULES.keys())}"
+        )
+    
+    country_info = COUNTRY_CODE_RULES[country_code]
+    
+    # Validate pincode length
+    min_length = country_info.get('pincode_length', 4)
+    if len(pincode) < min_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pincode too short. Minimum {min_length} characters required for {country_info['name']}"
+        )
+    
+    # Handle manual entry countries
+    if country_info.get('api_type') == 'manual':
+        result = {
+            "success": False,
+            "message": f"Manual entry required for {country_info['name']}",
+            "requires_manual": True,
+            "country": country_info['name'],
+            "pincode": pincode
+        }
+        pincode_cache[cache_key] = result
+        return result
+    
+    try:
+        # Fetch address based on country
+        if country_info['api_type'] == 'india':
+            address_data = await fetch_india_pincode(pincode)
+        elif country_info['api_type'] == 'zippopotam':
+            address_data = await fetch_zippopotam(pincode, country_code)
+        elif country_info['api_type'] == 'postcodes_io':
+            address_data = await fetch_uk_postcode(pincode)
+        else:
+            address_data = None
+        
+        if address_data and address_data.get('success'):
+            result = {
+                "success": True,
+                "data": address_data['data'],
+                "country": country_info['name'],
+                "pincode": pincode,
+                "source": address_data.get('source', 'primary')
+            }
+        else:
+            result = {
+                "success": False,
+                "message": address_data.get('message', 'No address found for this pincode'),
+                "country": country_info['name'],
+                "pincode": pincode,
+                "suggestions": address_data.get('suggestions', [])
+            }
+        
+        # Cache the result
+        pincode_cache[cache_key] = result
+        return result
+        
+    except Exception as e:
+        error_result = {
+            "success": False,
+            "message": f"Service temporarily unavailable: {str(e)}",
+            "country": country_info['name'],
+            "pincode": pincode,
+            "error": str(e),
+            "requires_manual": True
+        }
+        return error_result
+
+async def fetch_india_pincode(pincode: str) -> Dict:
+    """Fetch address data for Indian pincode"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = COUNTRY_CODE_RULES['+91']['api_endpoint'].format(pincode=pincode)
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if (isinstance(data, list) and len(data) > 0 and 
+                    data[0].get('Status') == "Success" and 
+                    data[0].get('PostOffice')):
+                    
+                    office = data[0]['PostOffice'][0]
+                    return {
+                        "success": True,
+                        "data": {
+                            "area": office.get('Name', ''),
+                            "town": office.get('Block', office.get('District', '')),
+                            "city": office.get('District', ''),
+                            "district": office.get('District', ''),
+                            "state": office.get('State', ''),
+                            "country": "India"
+                        },
+                        "source": "api.postalpincode.in"
+                    }
+        
+        # Fallback to geonames API
+        return await fallback_geonames_lookup(pincode, 'IN')
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error fetching India pincode: {str(e)}",
+            "error": str(e)
+        }
+
+async def fetch_zippopotam(pincode: str, country_code: str) -> Dict:
+    """Fetch address data for US/Canada using Zippopotam"""
+    try:
+        country = 'us' if country_code == '+1' else 'ca'
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = COUNTRY_CODE_RULES[country_code]['api_endpoint'].format(
+                country=country, pincode=pincode
+            )
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('places') and len(data['places']) > 0:
+                    place = data['places'][0]
+                    country_name = 'United States' if country == 'us' else 'Canada'
+                    
+                    return {
+                        "success": True,
+                        "data": {
+                            "area": place.get('place name', ''),
+                            "town": place.get('place name', ''),
+                            "city": place.get('place name', ''),
+                            "district": place.get('state', place.get('state abbreviation', '')),
+                            "state": place.get('state', ''),
+                            "country": country_name
+                        },
+                        "source": "api.zippopotam.us"
+                    }
+        
+        return {
+            "success": False,
+            "message": "No address found for this zipcode"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error fetching zipcode: {str(e)}",
+            "error": str(e)
+        }
+
+async def fetch_uk_postcode(postcode: str) -> Dict:
+    """Fetch address data for UK postcode"""
+    try:
+        # Clean postcode
+        clean_postcode = postcode.replace(' ', '').upper()
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = COUNTRY_CODE_RULES['+44']['api_endpoint'].format(postcode=clean_postcode)
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('status') == 200 and data.get('result'):
+                    result = data['result']
+                    return {
+                        "success": True,
+                        "data": {
+                            "area": result.get('admin_ward', ''),
+                            "town": result.get('admin_district', result.get('region', '')),
+                            "city": result.get('admin_district', result.get('region', '')),
+                            "district": result.get('region', result.get('country', '')),
+                            "state": result.get('region', ''),
+                            "country": "United Kingdom"
+                        },
+                        "source": "api.postcodes.io"
+                    }
+        
+        return {
+            "success": False,
+            "message": "No address found for this postcode"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error fetching UK postcode: {str(e)}",
+            "error": str(e)
+        }
+
+async def fallback_geonames_lookup(code: str, country_code: str) -> Dict:
+    """Fallback lookup using Geonames API (requires API key)"""
+    # This is a placeholder - you need to get a free API key from geonames.org
+    geonames_username = "demo"  # Replace with your geonames username
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = f"http://api.geonames.org/postalCodeSearchJSON"
+            params = {
+                'postalcode': code,
+                'country': country_code,
+                'maxRows': 1,
+                'username': geonames_username
+            }
+            
+            response = await client.get(url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('postalCodes') and len(data['postalCodes']) > 0:
+                    place = data['postalCodes'][0]
+                    return {
+                        "success": True,
+                        "data": {
+                            "area": place.get('placeName', ''),
+                            "town": place.get('adminName2', place.get('adminName1', '')),
+                            "city": place.get('adminName2', place.get('adminName1', '')),
+                            "district": place.get('adminName1', ''),
+                            "state": place.get('adminName1', ''),
+                            "country": place.get('countryCode', '')
+                        },
+                        "source": "geonames.org"
+                    }
+        
+        return {
+            "success": False,
+            "message": "No address found in fallback service"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Fallback service error: {str(e)}"
+        }
+
+@app.get("/api/country-codes")
+async def get_country_codes():
+    """Get available country codes and their rules"""
+    simplified_rules = {}
+    for code, info in COUNTRY_CODE_RULES.items():
+        simplified_rules[code] = {
+            "name": info['name'],
+            "phone_length": info['length'],
+            "pincode_length": info.get('pincode_length', 0),
+            "supported": info.get('api_type') != 'manual'
+        }
+    
+    return {
+        "country_codes": simplified_rules,
+        "count": len(simplified_rules),
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ============== EXISTING RSS & PRICE APIS ==============
 @app.get("/live-basmati-prices")
 async def get_live_basmati_prices():
-    """
-    Generate realistic live prices for basmati rice with market trends
-    """
+    """Generate realistic live prices for basmati rice with market trends"""
     try:
-        # Get current market sentiment
         market_trend = await get_market_sentiment()
-        
         live_prices = []
         
         for product, details in BASE_BASMATI_PRICES.items():
             base_price = details["base_price"]
             volatility = details["volatility"]
             
-            # Adjust price based on market sentiment
             if market_trend["overall_sentiment"] == "bullish":
-                trend_factor = random.uniform(0.005, 0.015)  # 0.5% to 1.5% increase
+                trend_factor = random.uniform(0.005, 0.015)
             elif market_trend["overall_sentiment"] == "bearish":
-                trend_factor = random.uniform(-0.015, -0.005)  # 0.5% to 1.5% decrease
+                trend_factor = random.uniform(-0.015, -0.005)
             else:
-                trend_factor = random.uniform(-0.005, 0.005)  # Neutral
+                trend_factor = random.uniform(-0.005, 0.005)
             
-            # Add random volatility
             volatility_factor = random.uniform(-volatility, volatility)
-            
-            # Calculate final price
             final_price = base_price * (1 + trend_factor + volatility_factor)
             final_price = round(final_price, 2)
             
-            # Determine trend direction for display
             price_change = final_price - base_price
             if price_change > 5:
                 trend = "up"
@@ -193,11 +533,8 @@ async def get_live_basmati_prices():
         }
 
 async def get_market_sentiment():
-    """
-    Analyze market sentiment based on recent news and trends
-    """
+    """Analyze market sentiment based on recent news and trends"""
     try:
-        # Simulate market analysis (in real implementation, this would analyze news feeds)
         factors = {
             "export_demand": random.choice(["strong", "moderate", "weak"]),
             "supply_conditions": random.choice(["tight", "adequate", "surplus"]),
@@ -205,7 +542,6 @@ async def get_market_sentiment():
             "global_demand": random.choice(["increasing", "stable", "decreasing"])
         }
         
-        # Determine overall sentiment
         positive_factors = sum(1 for factor in factors.values() 
                              if factor in ["strong", "adequate", "favorable", "increasing"])
         
@@ -265,9 +601,7 @@ async def fetch_single_feed(source, is_indian_agri=False):
 
 @app.get("/rss")
 async def get_rss_feed():
-    """
-    Fetches latest RSS articles from multiple sources with enhanced rice filtering
-    """
+    """Fetches latest RSS articles from multiple sources with enhanced rice filtering"""
     try:
         tasks = [fetch_single_feed(source) for source in RSS_SOURCES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -324,9 +658,7 @@ async def get_rss_feed():
 
 @app.get("/indian-agri-rss")
 async def get_indian_agri_rss():
-    """
-    Fetches Indian Agriculture and DGFT related RSS feeds with enhanced filtering
-    """
+    """Fetches Indian Agriculture and DGFT related RSS feeds with enhanced filtering"""
     try:
         tasks = [fetch_single_feed(source, is_indian_agri=True) for source in INDIAN_AGRI_RSS_SOURCES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -436,15 +768,41 @@ def health_check():
     return {
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "service": "Agriculture RSS & Live Prices API",
-        "version": "3.0",
+        "service": "Agriculture RSS & Location Services API",
+        "version": "4.0",
         "endpoints": {
             "live_prices": "/live-basmati-prices",
             "rice_rss": "/rss",
-            "indian_agri_rss": "/indian-agri-rss"
+            "indian_agri_rss": "/indian-agri-rss",
+            "pincode_lookup": "/api/pincode-lookup?pincode=110001&country_code=+91",
+            "country_codes": "/api/country-codes"
+        },
+        "cache_stats": {
+            "size": len(pincode_cache),
+            "max_size": 1000,
+            "ttl_seconds": 86400
         }
     }
 
-if __name__ == "__main__":
+@app.get("/api/cache-stats")
+def cache_stats():
+    """Get cache statistics"""
+    return {
+        "cache_size": len(pincode_cache),
+        "max_size": 1000,
+        "ttl_seconds": 86400,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.delete("/api/clear-cache")
+def clear_cache():
+    """Clear the pincode cache"""
+    pincode_cache.clear()
+    return {
+        "message": "Cache cleared successfully",
+        "timestamp": datetime.now().isoformat()
+    }
+
+if _name_ == "_main_":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

@@ -23,7 +23,7 @@ razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 paypalrestsdk.configure({
     "mode": "sandbox",  # Change to "live" for production
     "client_id": "AURJ-JxP9ks57rmAjpgygYWhay5TjDahC_6o5s89h7tu73o-UIlm7mYFSb_CSqS3u7l1TDAyQizRXLqV",
-    "client_secret": "EHXLKzPPM12wGTHtNEnjVr9dEp0T8w9T_OH86wXg8ShYLSYoFmN_VTrMnrIIuOTnJ9HkGmZQ4wlsy9O3"
+    "client_secret": "EJyrkc1fVEoPtY3hUgOW-WlhCSGzomz0EsZhhvAzzxdEAQwL6lZoIY4lfT-BKFShOjK611R-pcvOHk6Z"
 })
 
 app.add_middleware(
